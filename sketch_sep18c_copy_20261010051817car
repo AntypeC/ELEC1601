@@ -1,0 +1,238 @@
+#include <Servo.h>
+
+const int frontIrLedPin = 6;
+const int frontReceiverPin = 7;
+const int frontRedLedPin = A1;
+
+const int leftIrLedPin = 10;
+const int leftReceiverPin = 11;
+const int leftRedLedPin = A2;
+
+const int rightIrLedPin = 2;
+const int rightReceiverPin = 3;
+const int rightRedLedPin = A0;
+
+const int leftServoPin = 13;
+const int rightServoPin = 12;
+
+const int leftStop = 1500;
+const int rightStop = 1500;
+
+const int leftForwardSpeed = 30;
+const int rightForwardSpeed = 35;
+
+const int turnSpeed = 50;
+
+const int forwardStepTime = 20;
+const int backwardTime = 500;
+const int turnTime = 900;
+
+const int detectionThreshold = 5;
+
+Servo leftWheel;
+Servo rightWheel;
+
+void stopRobot(int duration)
+{
+  leftWheel.writeMicroseconds(leftStop);
+  rightWheel.writeMicroseconds(rightStop);
+  delay(duration);
+}
+
+void moveForward(int duration)
+{
+  leftWheel.writeMicroseconds(
+    leftStop + leftForwardSpeed
+  );
+
+  rightWheel.writeMicroseconds(
+    rightStop - rightForwardSpeed
+  );
+
+  delay(duration);
+}
+
+void moveBackward(int duration)
+{
+  leftWheel.writeMicroseconds(
+    leftStop - leftForwardSpeed
+  );
+
+  rightWheel.writeMicroseconds(
+    rightStop + rightForwardSpeed
+  );
+
+  delay(duration);
+  stopRobot(100);
+}
+
+void turnLeft(int duration)
+{
+  leftWheel.writeMicroseconds(
+    leftStop - turnSpeed
+  );
+
+  rightWheel.writeMicroseconds(
+    rightStop - turnSpeed
+  );
+
+  delay(duration);
+  stopRobot(100);
+}
+
+void turnRight(int duration)
+{
+  leftWheel.writeMicroseconds(
+    leftStop + turnSpeed
+  );
+
+  rightWheel.writeMicroseconds(
+    rightStop + turnSpeed
+  );
+
+  delay(duration);
+  stopRobot(100);
+}
+
+int irDetect(
+  int irLedPin,
+  int receiverPin,
+  long frequency
+)
+{
+  tone(irLedPin, frequency);
+  delay(1);
+
+  int result = digitalRead(receiverPin);
+
+  noTone(irLedPin);
+  delay(1);
+
+  return result;
+}
+
+int irDistance(
+  int irLedPin,
+  int receiverPin
+)
+{
+  int distance = 0;
+
+  for (
+    long frequency = 38000;
+    frequency <= 45000;
+    frequency += 1000
+  )
+  {
+    distance += irDetect(
+      irLedPin,
+      receiverPin,
+      frequency
+    );
+  }
+
+  return distance;
+}
+
+void setup()
+{
+  Serial.begin(9600);
+
+  pinMode(frontIrLedPin, OUTPUT);
+  pinMode(leftIrLedPin, OUTPUT);
+  pinMode(rightIrLedPin, OUTPUT);
+
+  pinMode(frontReceiverPin, INPUT);
+  pinMode(leftReceiverPin, INPUT);
+  pinMode(rightReceiverPin, INPUT);
+
+  pinMode(frontRedLedPin, OUTPUT);
+  pinMode(leftRedLedPin, OUTPUT);
+  pinMode(rightRedLedPin, OUTPUT);
+
+  leftWheel.attach(leftServoPin);
+  rightWheel.attach(rightServoPin);
+
+  stopRobot(5000);
+}
+
+void loop()
+{
+  int frontDistance = irDistance(
+    frontIrLedPin,
+    frontReceiverPin
+  );
+
+  bool frontDetected =
+    frontDistance < detectionThreshold;
+
+  digitalWrite(
+    frontRedLedPin,
+    frontDetected ? HIGH : LOW
+  );
+
+  Serial.print("FRONT: ");
+  Serial.println(frontDistance);
+
+  if (!frontDetected)
+  {
+    Serial.println("ACTION: FORWARD");
+    moveForward(forwardStepTime);
+    return;
+  }
+
+  stopRobot(100);
+
+  int leftDistance = irDistance(
+    leftIrLedPin,
+    leftReceiverPin
+  );
+
+  int rightDistance = irDistance(
+    rightIrLedPin,
+    rightReceiverPin
+  );
+
+  bool leftDetected =
+    leftDistance < detectionThreshold;
+
+  bool rightDetected =
+    rightDistance < detectionThreshold;
+
+  digitalWrite(
+    leftRedLedPin,
+    leftDetected ? HIGH : LOW
+  );
+
+  digitalWrite(
+    rightRedLedPin,
+    rightDetected ? HIGH : LOW
+  );
+
+  Serial.print("LEFT: ");
+  Serial.print(leftDistance);
+
+  Serial.print("  RIGHT: ");
+  Serial.println(rightDistance);
+
+  if (leftDetected && rightDetected)
+  {
+    Serial.println("ACTION: BACKWARD");
+    moveBackward(backwardTime);
+  }
+  else if (rightDetected)
+  {
+    Serial.println("ACTION: TURN LEFT");
+    turnLeft(turnTime);
+  }
+  else if (leftDetected)
+  {
+    Serial.println("ACTION: TURN RIGHT");
+    turnRight(turnTime);
+  }
+  else
+  {
+    Serial.println("ACTION: STOP");
+    stopRobot(100);
+  }
+}
