@@ -2,15 +2,10 @@
 
 const int frontIrLedPin = 6;
 const int frontReceiverPin = 7;
-const int frontRedLedPin = A1;
-
 const int leftIrLedPin = 10;
 const int leftReceiverPin = 11;
-const int leftRedLedPin = A2;
-
 const int rightIrLedPin = 2;
 const int rightReceiverPin = 3;
-const int rightRedLedPin = A0;
 
 const int leftServoPin = 13;
 const int rightServoPin = 12;
@@ -18,87 +13,74 @@ const int rightServoPin = 12;
 const int leftStop = 1500;
 const int rightStop = 1500;
 
-const int leftForwardSpeed = 30;
-const int rightForwardSpeed = 35;
-
+const int forwardLeftSpeed = 30;
+const int forwardRightSpeed = 35;
 const int turnSpeed = 50;
 
-const int forwardStepTime = 20;
-const int backwardTime = 500;
-const int turnTime = 900;
+const int forward5cmTime = 1000;
+const int left90Time = 900;
+const int right90Time = 900;
+const int turn180Time = 1800;
+const int smallLeftTime = 300;
+const int smallRightTime = 300;
 
-const int detectionThreshold = 5;
+const int closeMaximum = 1;
+const int openMinimum = 5;
 
 Servo leftWheel;
 Servo rightWheel;
 
-void stopRobot(int duration)
+bool returningToStart = false;
+bool finished = false;
+
+void stopRobot()
 {
   leftWheel.writeMicroseconds(leftStop);
   rightWheel.writeMicroseconds(rightStop);
-  delay(duration);
+}
+
+void driveForward(int leftSpeed, int rightSpeed)
+{
+  leftWheel.writeMicroseconds(leftStop + leftSpeed);
+  rightWheel.writeMicroseconds(rightStop - rightSpeed);
 }
 
 void moveForward(int duration)
 {
-  leftWheel.writeMicroseconds(
-    leftStop + leftForwardSpeed
-  );
-
-  rightWheel.writeMicroseconds(
-    rightStop - rightForwardSpeed
-  );
-
+  driveForward(forwardLeftSpeed, forwardRightSpeed);
   delay(duration);
+  stopRobot();
+  delay(200);
 }
 
 void moveBackward(int duration)
 {
-  leftWheel.writeMicroseconds(
-    leftStop - leftForwardSpeed
-  );
-
-  rightWheel.writeMicroseconds(
-    rightStop + rightForwardSpeed
-  );
-
+  leftWheel.writeMicroseconds(leftStop - forwardLeftSpeed);
+  rightWheel.writeMicroseconds(rightStop + forwardRightSpeed);
   delay(duration);
-  stopRobot(100);
+  stopRobot();
+  delay(200);
 }
 
 void turnLeft(int duration)
 {
-  leftWheel.writeMicroseconds(
-    leftStop - turnSpeed
-  );
-
-  rightWheel.writeMicroseconds(
-    rightStop - turnSpeed
-  );
-
+  leftWheel.writeMicroseconds(leftStop - turnSpeed);
+  rightWheel.writeMicroseconds(rightStop - turnSpeed);
   delay(duration);
-  stopRobot(100);
+  stopRobot();
+  delay(200);
 }
 
 void turnRight(int duration)
 {
-  leftWheel.writeMicroseconds(
-    leftStop + turnSpeed
-  );
-
-  rightWheel.writeMicroseconds(
-    rightStop + turnSpeed
-  );
-
+  leftWheel.writeMicroseconds(leftStop + turnSpeed);
+  rightWheel.writeMicroseconds(rightStop + turnSpeed);
   delay(duration);
-  stopRobot(100);
+  stopRobot();
+  delay(200);
 }
 
-int irDetect(
-  int irLedPin,
-  int receiverPin,
-  long frequency
-)
+int irDetect(int irLedPin, int receiverPin, long frequency)
 {
   tone(irLedPin, frequency);
   delay(1);
@@ -111,27 +93,168 @@ int irDetect(
   return result;
 }
 
-int irDistance(
-  int irLedPin,
-  int receiverPin
-)
+int irDistance(int irLedPin, int receiverPin)
 {
-  int distance = 0;
+  int result = 0;
 
-  for (
-    long frequency = 38000;
-    frequency <= 45000;
-    frequency += 1000
-  )
+  for (long frequency = 38000; frequency <= 45000; frequency += 1000)
   {
-    distance += irDetect(
-      irLedPin,
-      receiverPin,
-      frequency
-    );
+    result += irDetect(irLedPin, receiverPin, frequency);
   }
 
-  return distance;
+  return result;
+}
+
+int averageDistance(int irLedPin, int receiverPin)
+{
+  int total = 0;
+
+  for (int i = 0; i < 3; i++)
+  {
+    total += irDistance(irLedPin, receiverPin);
+    delay(10);
+  }
+
+  return total / 3;
+}
+
+void readSensors(int &leftValue, int &frontValue, int &rightValue)
+{
+  leftValue = averageDistance(leftIrLedPin, leftReceiverPin);
+  frontValue = averageDistance(frontIrLedPin, frontReceiverPin);
+  rightValue = averageDistance(rightIrLedPin, rightReceiverPin);
+
+  Serial.print("LEFT=");
+  Serial.print(leftValue);
+  Serial.print(" FRONT=");
+  Serial.print(frontValue);
+  Serial.print(" RIGHT=");
+  Serial.println(rightValue);
+}
+
+void correctStartingPosition()
+{
+  int leftValue;
+  int frontValue;
+  int rightValue;
+
+  readSensors(leftValue, frontValue, rightValue);
+
+  bool frontOpen = frontValue >= openMinimum;
+  bool leftClose = leftValue <= closeMaximum;
+  bool rightClose = rightValue <= closeMaximum;
+  bool leftOpen = leftValue >= openMinimum;
+  bool rightOpen = rightValue >= openMinimum;
+
+  if (!frontOpen)
+  {
+    return;
+  }
+
+  if (leftClose && rightValue >= 2 && rightValue < openMinimum)
+  {
+    turnRight(smallRightTime);
+    moveForward(forward5cmTime);
+    turnLeft(smallLeftTime);
+    moveBackward(forward5cmTime);
+  }
+  else if (rightClose && leftValue >= 2 && leftValue < openMinimum)
+  {
+    turnLeft(smallLeftTime);
+    moveForward(forward5cmTime);
+    turnRight(smallRightTime);
+    moveBackward(forward5cmTime);
+  }
+  else if (leftClose && rightOpen)
+  {
+    turnRight(smallRightTime);
+  }
+  else if (leftOpen && rightClose)
+  {
+    turnLeft(smallLeftTime);
+  }
+}
+
+void followCorridor(int leftValue, int rightValue)
+{
+  int difference = leftValue - rightValue;
+
+  if (difference <= -2)
+  {
+    driveForward(38, 18);
+  }
+  else if (difference >= 2)
+  {
+    driveForward(18, 38);
+  }
+  else
+  {
+    driveForward(forwardLeftSpeed, forwardRightSpeed);
+  }
+}
+
+void performCorner(int leftValue, int rightValue)
+{
+  if (rightValue > leftValue)
+  {
+    turnRight(right90Time);
+    moveForward(forward5cmTime);
+  }
+  else if (leftValue > rightValue)
+  {
+    turnLeft(left90Time);
+    moveForward(forward5cmTime);
+  }
+  else if (rightValue > closeMaximum)
+  {
+    turnRight(right90Time);
+    moveForward(forward5cmTime);
+  }
+  else
+  {
+    stopRobot();
+    finished = true;
+  }
+}
+
+void handleFrontWall()
+{
+  stopRobot();
+  delay(200);
+
+  int leftValue;
+  int frontValue;
+  int rightValue;
+
+  readSensors(leftValue, frontValue, rightValue);
+
+  if (frontValue > closeMaximum)
+  {
+    return;
+  }
+
+  bool deadEnd =
+    leftValue <= closeMaximum &&
+    rightValue <= closeMaximum;
+
+  if (deadEnd)
+  {
+    if (!returningToStart)
+    {
+      turnRight(turn180Time);
+      moveForward(forward5cmTime);
+      returningToStart = true;
+    }
+    else
+    {
+      stopRobot();
+      finished = true;
+    }
+
+    return;
+  }
+
+  performCorner(leftValue, rightValue);
 }
 
 void setup()
@@ -146,93 +269,36 @@ void setup()
   pinMode(leftReceiverPin, INPUT);
   pinMode(rightReceiverPin, INPUT);
 
-  pinMode(frontRedLedPin, OUTPUT);
-  pinMode(leftRedLedPin, OUTPUT);
-  pinMode(rightRedLedPin, OUTPUT);
-
   leftWheel.attach(leftServoPin);
   rightWheel.attach(rightServoPin);
 
-  stopRobot(5000);
+  stopRobot();
+
+  correctStartingPosition();
 }
 
 void loop()
 {
-  int frontDistance = irDistance(
-    frontIrLedPin,
-    frontReceiverPin
-  );
-
-  bool frontDetected =
-    frontDistance < detectionThreshold;
-
-  digitalWrite(
-    frontRedLedPin,
-    frontDetected ? HIGH : LOW
-  );
-
-  Serial.print("FRONT: ");
-  Serial.println(frontDistance);
-
-  if (!frontDetected)
+  if (finished)
   {
-    Serial.println("ACTION: FORWARD");
-    moveForward(forwardStepTime);
+    stopRobot();
     return;
   }
 
-  stopRobot(100);
+  int leftValue;
+  int frontValue;
+  int rightValue;
 
-  int leftDistance = irDistance(
-    leftIrLedPin,
-    leftReceiverPin
-  );
+  readSensors(leftValue, frontValue, rightValue);
 
-  int rightDistance = irDistance(
-    rightIrLedPin,
-    rightReceiverPin
-  );
-
-  bool leftDetected =
-    leftDistance < detectionThreshold;
-
-  bool rightDetected =
-    rightDistance < detectionThreshold;
-
-  digitalWrite(
-    leftRedLedPin,
-    leftDetected ? HIGH : LOW
-  );
-
-  digitalWrite(
-    rightRedLedPin,
-    rightDetected ? HIGH : LOW
-  );
-
-  Serial.print("LEFT: ");
-  Serial.print(leftDistance);
-
-  Serial.print("  RIGHT: ");
-  Serial.println(rightDistance);
-
-  if (leftDetected && rightDetected)
+  if (frontValue <= closeMaximum)
   {
-    Serial.println("ACTION: BACKWARD");
-    moveBackward(backwardTime);
-  }
-  else if (rightDetected)
-  {
-    Serial.println("ACTION: TURN LEFT");
-    turnLeft(turnTime);
-  }
-  else if (leftDetected)
-  {
-    Serial.println("ACTION: TURN RIGHT");
-    turnRight(turnTime);
+    handleFrontWall();
   }
   else
   {
-    Serial.println("ACTION: STOP");
-    stopRobot(100);
+    followCorridor(leftValue, rightValue);
   }
+
+  delay(30);
 }
