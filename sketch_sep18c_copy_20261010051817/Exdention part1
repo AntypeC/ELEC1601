@@ -1,0 +1,829 @@
+#include <Servo.h>
+
+const int frontIrLedPin = 6;
+const int frontReceiverPin = 7;
+const int leftIrLedPin = 10;
+const int leftReceiverPin = 11;
+const int rightIrLedPin = 2;
+const int rightReceiverPin = 3;
+
+const int leftServoPin = 13;
+const int rightServoPin = 12;
+
+const int leftStop = 1500;
+const int rightStop = 1500;
+const int leftForwardDirection = 1;
+const int rightForwardDirection = -1;
+
+const int forwardLeftSpeed = 44;
+const int forwardRightSpeed = 65;
+const int minimumForwardPower = 22;
+const int maximumForwardPower = 80;
+
+const int slowLeftSpeed = 28;
+const int slowRightSpeed = 42;
+const int slowMinimumPower = 16;
+const int slowMaximumPower = 55;
+
+const int leftTurnPower = 78;
+const int rightTurnPower = 83;
+const int leftFineTurnPower = 62;
+const int rightFineTurnPower = 67;
+
+const int frontWallMaximum = 4;
+const int frontOpenMinimum = 5;
+const int sideWallMaximum = 4;
+const int sideDangerMaximum = 1;
+const int sideTarget = 3;
+
+const int correctionGain = 3;
+const int maximumCorrection = 20;
+const int emergencyCorrection = 20;
+
+const int clearReadingsRequired = 6;
+const int wallReadingsRequired = 2;
+
+const unsigned long cornerBackupTime = 180;
+const unsigned long cornerMinimumTurnTime = 420;
+const unsigned long cornerMaximumTurnTime = 1500;
+const unsigned long cornerExtraTurnTime = 40;
+
+const unsigned long turnAroundBackupTime = 750;
+const unsigned long turnAroundMinimumTime = 850;
+const unsigned long turnAroundMaximumTime = 2500;
+
+const unsigned long slowAfterTurnTime = 1000;
+
+Servo leftWheel;
+Servo rightWheel;
+
+bool returningToStart = false;
+bool turningEnabled = false;
+bool slowAfterTurnActive = false;
+
+int clearFrontReadings = 0;
+int frontWallReadings = 0;
+
+unsigned long lastSensorPrint = 0;
+unsigned long slowAfterTurnStart = 0;
+
+void stopRobot()
+{
+  leftWheel.writeMicroseconds(leftStop);
+  rightWheel.writeMicroseconds(rightStop);
+}
+
+void setWheelPowers(int leftPower, int rightPower)
+{
+  leftWheel.writeMicroseconds(
+    leftStop + leftForwardDirection * leftPower
+  );
+
+  rightWheel.writeMicroseconds(
+    rightStop + rightForwardDirection * rightPower
+  );
+}
+
+void driveForwardRaw()
+{
+  setWheelPowers(
+    forwardLeftSpeed,
+    forwardRightSpeed
+  );
+}
+
+void moveBackwardFor(unsigned long duration)
+{
+  setWheelPowers(
+    -forwardLeftSpeed,
+    -forwardRightSpeed
+  );
+
+  delay(duration);
+
+  stopRobot();
+
+  delay(50);
+}
+
+int irDetect(
+  int irLedPin,
+  int receiverPin,
+  long frequency
+)
+{
+  tone(irLedPin, frequency);
+
+  delay(1);
+
+  int result = digitalRead(receiverPin);
+
+  noTone(irLedPin);
+
+  delay(1);
+
+  return result;
+}
+
+int irDistance(
+  int irLedPin,
+  int receiverPin
+)
+{
+  int result = 0;
+
+  for (
+    long frequency = 38000;
+    frequency <= 45000;
+    frequency += 1000
+  )
+  {
+    result += irDetect(
+      irLedPin,
+      receiverPin,
+      frequency
+    );
+  }
+
+  return result;
+}
+
+int medianOfThree(
+  int first,
+  int second,
+  int third
+)
+{
+  if (first > second)
+  {
+    int temporary = first;
+    first = second;
+    second = temporary;
+  }
+
+  if (second > third)
+  {
+    int temporary = second;
+    second = third;
+    third = temporary;
+  }
+
+  if (first > second)
+  {
+    int temporary = first;
+    first = second;
+    second = temporary;
+  }
+
+  return second;
+}
+
+int stableDistance(
+  int irLedPin,
+  int receiverPin
+)
+{
+  int firstReading = irDistance(
+    irLedPin,
+    receiverPin
+  );
+
+  int secondReading = irDistance(
+    irLedPin,
+    receiverPin
+  );
+
+  int thirdReading = irDistance(
+    irLedPin,
+    receiverPin
+  );
+
+  return medianOfThree(
+    firstReading,
+    secondReading,
+    thirdReading
+  );
+}
+
+void readAllStable(
+  int &leftValue,
+  int &frontValue,
+  int &rightValue
+)
+{
+  frontValue = stableDistance(
+    frontIrLedPin,
+    frontReceiverPin
+  );
+
+  leftValue = stableDistance(
+    leftIrLedPin,
+    leftReceiverPin
+  );
+
+  rightValue = stableDistance(
+    rightIrLedPin,
+    rightReceiverPin
+  );
+}
+
+void printSensors(
+  int leftValue,
+  int frontValue,
+  int rightValue
+)
+{
+  if (millis() - lastSensorPrint < 200)
+  {
+    return;
+  }
+
+  lastSensorPrint = millis();
+
+  Serial.print(F("LEFT="));
+  Serial.print(leftValue);
+
+  Serial.print(F(" FRONT="));
+  Serial.print(frontValue);
+
+  Serial.print(F(" RIGHT="));
+  Serial.print(rightValue);
+
+  Serial.print(F(" ENABLED="));
+  Serial.print(turningEnabled ? 1 : 0);
+
+  Serial.print(F(" RETURNING="));
+  Serial.println(returningToStart ? 1 : 0);
+}
+
+void driveForwardCorrected(
+  int leftValue,
+  int rightValue
+)
+{
+  bool leftWall =
+    leftValue <= sideWallMaximum;
+
+  bool rightWall =
+    rightValue <= sideWallMaximum;
+
+  int correction = 0;
+
+  if (
+    leftValue <= sideDangerMaximum &&
+    rightValue > sideDangerMaximum
+  )
+  {
+    correction = emergencyCorrection;
+  }
+  else if (
+    rightValue <= sideDangerMaximum &&
+    leftValue > sideDangerMaximum
+  )
+  {
+    correction = -emergencyCorrection;
+  }
+  else if (
+    leftWall &&
+    rightWall
+  )
+  {
+    correction =
+      (rightValue - leftValue) *
+      correctionGain;
+  }
+  else if (leftWall)
+  {
+    correction =
+      (sideTarget - leftValue) *
+      correctionGain;
+  }
+  else if (rightWall)
+  {
+    correction =
+      (rightValue - sideTarget) *
+      correctionGain;
+  }
+
+  correction = constrain(
+    correction,
+    -maximumCorrection,
+    maximumCorrection
+  );
+
+  int leftPower = constrain(
+    forwardLeftSpeed + correction,
+    minimumForwardPower,
+    maximumForwardPower
+  );
+
+  int rightPower = constrain(
+    forwardRightSpeed - correction,
+    minimumForwardPower,
+    maximumForwardPower
+  );
+
+  setWheelPowers(
+    leftPower,
+    rightPower
+  );
+}
+
+void driveSlowCorrected(
+  int leftValue,
+  int rightValue
+)
+{
+  bool leftWall =
+    leftValue <= sideWallMaximum;
+
+  bool rightWall =
+    rightValue <= sideWallMaximum;
+
+  int correction = 0;
+
+  if (
+    leftValue <= sideDangerMaximum &&
+    rightValue > sideDangerMaximum
+  )
+  {
+    correction = 12;
+  }
+  else if (
+    rightValue <= sideDangerMaximum &&
+    leftValue > sideDangerMaximum
+  )
+  {
+    correction = -12;
+  }
+  else if (
+    leftWall &&
+    rightWall
+  )
+  {
+    correction =
+      (rightValue - leftValue) * 2;
+  }
+  else if (leftWall)
+  {
+    correction =
+      (sideTarget - leftValue) * 2;
+  }
+  else if (rightWall)
+  {
+    correction =
+      (rightValue - sideTarget) * 2;
+  }
+
+  correction = constrain(
+    correction,
+    -12,
+    12
+  );
+
+  int leftPower = constrain(
+    slowLeftSpeed + correction,
+    slowMinimumPower,
+    slowMaximumPower
+  );
+
+  int rightPower = constrain(
+    slowRightSpeed - correction,
+    slowMinimumPower,
+    slowMaximumPower
+  );
+
+  setWheelPowers(
+    leftPower,
+    rightPower
+  );
+}
+
+void setRotation(
+  bool turnRight,
+  bool fineMovement
+)
+{
+  int leftPower =
+    fineMovement
+      ? leftFineTurnPower
+      : leftTurnPower;
+
+  int rightPower =
+    fineMovement
+      ? rightFineTurnPower
+      : rightTurnPower;
+
+  if (turnRight)
+  {
+    setWheelPowers(
+      leftPower,
+      -rightPower
+    );
+  }
+  else
+  {
+    setWheelPowers(
+      -leftPower,
+      rightPower
+    );
+  }
+}
+
+bool rotateUntilFrontOpen(
+  bool turnRight,
+  unsigned long minimumTime,
+  unsigned long maximumTime,
+  bool fineAfterMinimum
+)
+{
+  unsigned long startTime = millis();
+
+  int openReadings = 0;
+
+  while (
+    millis() - startTime <
+    maximumTime
+  )
+  {
+    unsigned long elapsed =
+      millis() - startTime;
+
+    setRotation(
+      turnRight,
+      fineAfterMinimum &&
+      elapsed >= minimumTime
+    );
+
+    delay(18);
+
+    int frontValue = irDistance(
+      frontIrLedPin,
+      frontReceiverPin
+    );
+
+    if (
+      elapsed >= minimumTime &&
+      frontValue >= frontOpenMinimum
+    )
+    {
+      openReadings++;
+    }
+    else
+    {
+      openReadings = 0;
+    }
+
+    if (openReadings >= 2)
+    {
+      stopRobot();
+
+      delay(60);
+
+      return true;
+    }
+  }
+
+  stopRobot();
+
+  return false;
+}
+
+void lockTurning()
+{
+  turningEnabled = false;
+
+  clearFrontReadings = 0;
+
+  frontWallReadings = 0;
+
+  slowAfterTurnActive = true;
+
+  slowAfterTurnStart = millis();
+}
+
+bool performCorner(
+  bool turnRight
+)
+{
+  moveBackwardFor(
+    cornerBackupTime
+  );
+
+  if (
+    !rotateUntilFrontOpen(
+      turnRight,
+      cornerMinimumTurnTime,
+      cornerMaximumTurnTime,
+      true
+    )
+  )
+  {
+    return false;
+  }
+
+  setRotation(
+    turnRight,
+    true
+  );
+
+  delay(
+    cornerExtraTurnTime
+  );
+
+  stopRobot();
+
+  delay(60);
+
+  lockTurning();
+
+  return true;
+}
+
+bool performTurnAround()
+{
+  moveBackwardFor(
+    turnAroundBackupTime
+  );
+
+  if (
+    !rotateUntilFrontOpen(
+      true,
+      turnAroundMinimumTime,
+      turnAroundMaximumTime,
+      false
+    )
+  )
+  {
+    return false;
+  }
+
+  lockTurning();
+
+  return true;
+}
+
+void handleSensorCombination()
+{
+  stopRobot();
+
+  delay(60);
+
+  int leftValue;
+  int frontValue;
+  int rightValue;
+
+  readAllStable(
+    leftValue,
+    frontValue,
+    rightValue
+  );
+
+  printSensors(
+    leftValue,
+    frontValue,
+    rightValue
+  );
+
+  bool frontWall =
+    frontValue <= frontWallMaximum;
+
+  bool leftWall =
+    leftValue <= sideWallMaximum;
+
+  bool rightWall =
+    rightValue <= sideWallMaximum;
+
+  if (!frontWall)
+  {
+    frontWallReadings = 0;
+
+    return;
+  }
+
+  if (
+    leftWall &&
+    rightWall
+  )
+  {
+    if (performTurnAround())
+    {
+      returningToStart =
+        !returningToStart;
+    }
+
+    return;
+  }
+
+  if (
+    leftWall &&
+    !rightWall
+  )
+  {
+    performCorner(true);
+
+    return;
+  }
+
+  if (
+    !leftWall &&
+    rightWall
+  )
+  {
+    performCorner(false);
+
+    return;
+  }
+
+  stopRobot();
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(
+    frontIrLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    leftIrLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    rightIrLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    frontReceiverPin,
+    INPUT
+  );
+
+  pinMode(
+    leftReceiverPin,
+    INPUT
+  );
+
+  pinMode(
+    rightReceiverPin,
+    INPUT
+  );
+
+  leftWheel.attach(
+    leftServoPin
+  );
+
+  rightWheel.attach(
+    rightServoPin
+  );
+
+  stopRobot();
+
+  delay(500);
+}
+
+void loop()
+{
+  int frontValue = irDistance(
+    frontIrLedPin,
+    frontReceiverPin
+  );
+
+  int leftValue = irDistance(
+    leftIrLedPin,
+    leftReceiverPin
+  );
+
+  int rightValue = irDistance(
+    rightIrLedPin,
+    rightReceiverPin
+  );
+
+  printSensors(
+    leftValue,
+    frontValue,
+    rightValue
+  );
+
+  if (!turningEnabled)
+  {
+    if (
+      frontValue >=
+      frontOpenMinimum
+    )
+    {
+      clearFrontReadings++;
+
+      frontWallReadings = 0;
+
+      if (
+        clearFrontReadings >=
+        clearReadingsRequired
+      )
+      {
+        turningEnabled = true;
+
+        frontWallReadings = 0;
+      }
+    }
+    else
+    {
+      clearFrontReadings = 0;
+    }
+
+    if (slowAfterTurnActive)
+    {
+      if (
+        frontValue <=
+        frontWallMaximum
+      )
+      {
+        stopRobot();
+
+        frontWallReadings++;
+
+        if (
+          frontWallReadings >=
+          wallReadingsRequired
+        )
+        {
+          turningEnabled = true;
+
+          frontWallReadings = 0;
+
+          handleSensorCombination();
+        }
+      }
+      else
+      {
+        driveSlowCorrected(
+          leftValue,
+          rightValue
+        );
+      }
+    }
+    else
+    {
+      driveForwardRaw();
+    }
+
+    delay(3);
+
+    return;
+  }
+
+  if (
+    slowAfterTurnActive &&
+    millis() - slowAfterTurnStart >=
+    slowAfterTurnTime
+  )
+  {
+    slowAfterTurnActive = false;
+  }
+
+  if (
+    frontValue <=
+    frontWallMaximum
+  )
+  {
+    stopRobot();
+
+    frontWallReadings++;
+
+    if (
+      frontWallReadings >=
+      wallReadingsRequired
+    )
+    {
+      frontWallReadings = 0;
+
+      handleSensorCombination();
+    }
+
+    delay(3);
+
+    return;
+  }
+
+  frontWallReadings = 0;
+
+  if (slowAfterTurnActive)
+  {
+    driveSlowCorrected(
+      leftValue,
+      rightValue
+    );
+  }
+  else
+  {
+    driveForwardCorrected(
+      leftValue,
+      rightValue
+    );
+  }
+
+  delay(3);
+}
