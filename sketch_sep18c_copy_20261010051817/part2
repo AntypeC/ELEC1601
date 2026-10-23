@@ -1,0 +1,700 @@
+#include <Servo.h>
+
+const int irLedPin = 6;
+const int irLedPinLEFT = 10;
+const int irLedPinRIGHT = 2;
+
+const int irReceiver = 7;
+const int irReceiverLEFT = 11;
+const int irReceiverRIGHT = 3;
+
+const int LedPin = A1;
+const int LedPinLEFT = A2;
+const int LedPinRIGHT = A0;
+
+Servo leftWheel;
+Servo rightWheel;
+
+const int VELOCITY = 35;
+const int SLOW_VELOCITY = 30;
+const int TURN_POWER = 120;
+
+const int FRONT_STOP = 5;
+const int FRONT_SLOW = 6;
+
+const int SIDE_OPEN = 7;
+const int SIDE_WALL = 5;
+const int SIDE_TARGET = 4;
+
+const unsigned long LEFT_90_MS = 300;
+const unsigned long RIGHT_90_MS = 300;
+const unsigned long UTURN_MS = 600;
+
+const unsigned long CENTER_MS = 150;
+const unsigned long CONFIRM_MS = 500;
+const unsigned long MAX_RECOVERY_MS = 300;
+
+const unsigned long TWO_WALL_MS = 0;
+const unsigned int LENGTH_ERROR_PERCENT = 15;
+
+const int MAX_NODES = 64;
+
+struct RouteNode {
+  byte entry;
+  byte exit;
+  byte remaining;
+};
+
+RouteNode route[MAX_NODES];
+
+int depth = 0;
+byte heading = 0;
+
+bool returning = false;
+bool initialDeadEndVisited = false;
+bool finished = false;
+
+int leftReading = 0;
+int frontReading = 0;
+int rightReading = 0;
+
+bool leftReady = true;
+bool rightReady = true;
+
+int leftOpenCount = 0;
+int rightOpenCount = 0;
+
+int leftWallCount = 0;
+int rightWallCount = 0;
+
+bool moving = false;
+bool rotating = false;
+bool segmentKnown = false;
+
+unsigned long motionStarted = 0;
+unsigned long segmentMs = 0;
+
+bool turnPending = false;
+bool turnLeft = true;
+bool recoveryRunning = false;
+
+unsigned long recoveryStarted = 0;
+
+void accountMotion() {
+  if (moving) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - motionStarted;
+
+    segmentMs += elapsed;
+    motionStarted = now;
+  }
+}
+
+void stopWheels() {
+  accountMotion();
+
+  moving = false;
+  rotating = false;
+
+  leftWheel.writeMicroseconds(1495);
+  rightWheel.writeMicroseconds(1498);
+}
+
+void forward(int speed, int tilt) {
+  rotating = false;
+
+  leftWheel.writeMicroseconds(1500 + speed);
+
+  rightWheel.writeMicroseconds(
+    1500 - (speed + 15) + tilt
+  );
+
+  if (!moving) {
+    motionStarted = millis();
+    moving = true;
+  }
+}
+
+void rotateContinuous(bool left) {
+  accountMotion();
+
+  moving = false;
+  rotating = true;
+
+  int pulse = left
+    ? 1500 - TURN_POWER
+    : 1500 + TURN_POWER;
+
+  leftWheel.writeMicroseconds(pulse);
+  rightWheel.writeMicroseconds(pulse);
+}
+
+void startTurn(bool left, unsigned long duration) {
+  stopWheels();
+
+  rotateContinuous(left);
+  delay(duration);
+
+  stopWheels();
+
+  turnLeft = left;
+  turnPending = true;
+  recoveryRunning = false;
+}
+
+int irDistance(int emitter, int receiver, int led) {
+  int value = 0;
+
+  for (long f = 38000; f <= 45000; f += 1000) {
+    tone(emitter, f);
+    delay(5);
+
+    value += digitalRead(receiver);
+
+    noTone(emitter);
+  }
+
+  digitalWrite(led, value != 8 ? HIGH : LOW);
+
+  return value;
+}
+
+int readFront() {
+  int value = irDistance(
+    irLedPin, irReceiver, LedPin
+  );
+
+  if (value <= FRONT_STOP && !rotating) {
+    stopWheels();
+  }
+
+  return value;
+}
+
+void readSensors() {
+  frontReading = readFront();
+
+  leftReading = irDistance(
+    irLedPinLEFT, irReceiverLEFT, LedPinLEFT
+  );
+
+  int check = readFront();
+
+  if (check < frontReading) {
+    frontReading = check;
+  }
+
+  rightReading = irDistance(
+    irLedPinRIGHT, irReceiverRIGHT, LedPinRIGHT
+  );
+
+  check = readFront();
+
+  if (check < frontReading) {
+    frontReading = check;
+  }
+}
+
+void confirmSensors() {
+  stopWheels();
+
+  unsigned long started = millis();
+
+  readSensors();
+
+  int l = leftReading;
+  int f = frontReading;
+  int r = rightReading;
+
+  readSensors();
+
+  if (l < leftReading) {
+    leftReading = l;
+  }
+
+  if (f < frontReading) {
+    frontReading = f;
+  }
+
+  if (r < rightReading) {
+    rightReading = r;
+  }
+
+  unsigned long elapsed = millis() - started;
+
+  if (elapsed < CONFIRM_MS) {
+    delay(CONFIRM_MS - elapsed);
+  }
+}
+
+void printSensors() {
+  Serial.print(F("L="));
+  Serial.print(leftReading);
+
+  Serial.print(F(" F="));
+  Serial.print(frontReading);
+
+  Serial.print(F(" R="));
+  Serial.println(rightReading);
+}
+
+void clearRoute() {
+  depth = 0;
+  returning = false;
+  initialDeadEndVisited = false;
+}
+
+bool recoverTurn() {
+  int front = readFront();
+
+  if (front > FRONT_STOP) {
+    stopWheels();
+
+    turnPending = false;
+    recoveryRunning = false;
+
+    forward(SLOW_VELOCITY, 0);
+
+    return true;
+  }
+
+  if (!recoveryRunning) {
+    recoveryStarted = millis();
+    recoveryRunning = true;
+
+    rotateContinuous(turnLeft);
+
+    return false;
+  }
+
+  if (millis() - recoveryStarted >= MAX_RECOVERY_MS) {
+    stopWheels();
+
+    turnPending = false;
+    recoveryRunning = false;
+
+    clearRoute();
+
+    heading = 0;
+    segmentKnown = false;
+    segmentMs = 0;
+
+    leftReady = true;
+    rightReady = true;
+
+    leftOpenCount = 0;
+    rightOpenCount = 0;
+
+    leftWallCount = 0;
+    rightWallCount = 0;
+
+    Serial.println(F("RECHECK EXITS"));
+
+    return true;
+  }
+
+  return false;
+}
+
+byte directionBit(byte direction) {
+  return (byte)(1U << direction);
+}
+
+byte availableDirections() {
+  byte mask = directionBit((heading + 2) % 4);
+
+  if (leftReading >= SIDE_OPEN) {
+    mask |= directionBit((heading + 3) % 4);
+  }
+
+  if (frontReading > FRONT_STOP) {
+    mask |= directionBit(heading);
+  }
+
+  if (rightReading >= SIDE_OPEN) {
+    mask |= directionBit((heading + 1) % 4);
+  }
+
+  return mask;
+}
+
+int chooseExit(byte mask) {
+  byte order[4] = {
+    (byte)((heading + 3) % 4),
+    heading,
+    (byte)((heading + 1) % 4),
+    (byte)((heading + 2) % 4)
+  };
+
+  for (int i = 0; i < 4; i++) {
+    if (mask & directionBit(order[i])) {
+      return order[i];
+    }
+  }
+
+  return -1;
+}
+
+int planAtNode(byte available) {
+  if (returning && depth > 0) {
+    RouteNode &node = route[depth - 1];
+
+    if (heading != (node.exit + 2) % 4) {
+      return -2;
+    }
+
+    if (node.remaining != 0) {
+      int chosen = chooseExit(
+        node.remaining & available
+      );
+
+      if (chosen < 0) {
+        return -2;
+      }
+
+      node.remaining &=
+        (byte)~directionBit(chosen);
+
+      node.exit = chosen;
+      returning = false;
+
+      return chosen;
+    }
+
+    byte back = (node.entry + 2) % 4;
+
+    if (!(available & directionBit(back))) {
+      return -2;
+    }
+
+    depth--;
+
+    return back;
+  }
+
+  returning = false;
+
+  byte options = available &
+    (byte)~directionBit((heading + 2) % 4);
+
+  int chosen = chooseExit(options);
+
+  if (chosen < 0 || depth >= MAX_NODES) {
+    return -2;
+  }
+
+  route[depth].entry = heading;
+  route[depth].exit = chosen;
+
+  route[depth].remaining =
+    options & (byte)~directionBit(chosen);
+
+  depth++;
+
+  return chosen;
+}
+
+void resetSegment() {
+  stopWheels();
+
+  segmentMs = 0;
+  segmentKnown = true;
+
+  leftReady = false;
+  rightReady = false;
+
+  leftOpenCount = 0;
+  rightOpenCount = 0;
+
+  leftWallCount = 0;
+  rightWallCount = 0;
+}
+
+void moveDirection(byte chosen) {
+  byte delta = (chosen + 4 - heading) % 4;
+
+  resetSegment();
+
+  if (delta == 3) {
+    Serial.println(F("LEFT"));
+
+    startTurn(true, LEFT_90_MS);
+
+  } else if (delta == 1) {
+    Serial.println(F("RIGHT"));
+
+    startTurn(false, RIGHT_90_MS);
+
+  } else if (delta == 2) {
+    Serial.println(F("U-TURN"));
+
+    startTurn(true, UTURN_MS);
+
+  } else {
+    Serial.println(F("STRAIGHT"));
+
+    forward(VELOCITY, 0);
+  }
+
+  heading = chosen;
+}
+
+void updateOpenings() {
+  if (!leftReady) {
+    if (leftReading <= SIDE_WALL) {
+      leftWallCount++;
+    } else {
+      leftWallCount = 0;
+    }
+
+    if (leftWallCount >= 2) {
+      leftReady = true;
+    }
+  }
+
+  if (!rightReady) {
+    if (rightReading <= SIDE_WALL) {
+      rightWallCount++;
+    } else {
+      rightWallCount = 0;
+    }
+
+    if (rightWallCount >= 2) {
+      rightReady = true;
+    }
+  }
+
+  if (leftReady && leftReading >= SIDE_OPEN) {
+    if (leftOpenCount < 2) {
+      leftOpenCount++;
+    }
+  } else {
+    leftOpenCount = 0;
+  }
+
+  if (rightReady && rightReading >= SIDE_OPEN) {
+    if (rightOpenCount < 2) {
+      rightOpenCount++;
+    }
+  } else {
+    rightOpenCount = 0;
+  }
+}
+
+void centerAtJunction() {
+  forward(SLOW_VELOCITY, 0);
+
+  unsigned long started = millis();
+
+  while (millis() - started < CENTER_MS) {
+    frontReading = readFront();
+
+    if (frontReading <= FRONT_STOP) {
+      break;
+    }
+  }
+}
+
+bool targetLength() {
+  if (!segmentKnown || TWO_WALL_MS == 0) {
+    return false;
+  }
+
+  unsigned long margin =
+    TWO_WALL_MS * LENGTH_ERROR_PERCENT / 100;
+
+  return segmentMs >= TWO_WALL_MS - margin &&
+         segmentMs <= TWO_WALL_MS + margin;
+}
+
+void handleDeadEnd() {
+  stopWheels();
+
+  Serial.print(F("DEAD END segment_ms="));
+  Serial.print(segmentMs);
+
+  Serial.print(F(" known="));
+  Serial.println(segmentKnown ? 1 : 0);
+
+  if (targetLength()) {
+    Serial.println(F("FINISH"));
+
+    finished = true;
+    return;
+  }
+
+  if (depth == 0) {
+    if (returning || initialDeadEndVisited) {
+      clearRoute();
+
+      Serial.println(F("RESTART SEARCH"));
+    }
+
+    initialDeadEndVisited = true;
+
+  } else {
+    returning = true;
+  }
+
+  moveDirection((heading + 2) % 4);
+
+  leftReady = true;
+  rightReady = true;
+}
+
+void handleFeature(bool frontEvent) {
+  if (frontEvent) {
+    confirmSensors();
+
+    if (frontReading > FRONT_STOP) {
+      forward(SLOW_VELOCITY, 0);
+      return;
+    }
+
+  } else {
+    bool validLeft =
+      leftReady && leftReading >= SIDE_OPEN;
+
+    bool validRight =
+      rightReady && rightReading >= SIDE_OPEN;
+
+    if (!validLeft && !validRight) {
+      leftOpenCount = 0;
+      rightOpenCount = 0;
+      return;
+    }
+
+    centerAtJunction();
+
+    if (frontReading <= FRONT_STOP) {
+      confirmSensors();
+    }
+  }
+
+  printSensors();
+
+  byte available = availableDirections();
+
+  byte options = available &
+    (byte)~directionBit((heading + 2) % 4);
+
+  if (options == 0) {
+    handleDeadEnd();
+    return;
+  }
+
+  int chosen = planAtNode(available);
+
+  if (chosen < 0) {
+    Serial.println(F("REBUILD ROUTE"));
+
+    clearRoute();
+    chosen = planAtNode(available);
+  }
+
+  if (chosen >= 0) {
+    moveDirection(chosen);
+  }
+}
+
+void followCorridor() {
+  int speed = frontReading <= FRONT_SLOW
+    ? SLOW_VELOCITY
+    : VELOCITY;
+
+  int tilt = 0;
+
+  bool leftWall = leftReading < SIDE_OPEN;
+  bool rightWall = rightReading < SIDE_OPEN;
+
+  if (leftWall && rightWall) {
+    if (leftReading > rightReading) {
+      tilt = -10;
+    } else if (rightReading > leftReading) {
+      tilt = 10;
+    }
+
+  } else if (leftWall) {
+    if (leftReading < SIDE_TARGET) {
+      tilt = 10;
+    } else if (leftReading > SIDE_TARGET) {
+      tilt = -10;
+    }
+
+  } else if (rightWall) {
+    if (rightReading < SIDE_TARGET) {
+      tilt = -10;
+    } else if (rightReading > SIDE_TARGET) {
+      tilt = 10;
+    }
+  }
+
+  if (leftReading <= 1 && rightReading > 1) {
+    speed = SLOW_VELOCITY;
+    tilt = 18;
+
+  } else if (rightReading <= 1 && leftReading > 1) {
+    speed = SLOW_VELOCITY;
+    tilt = -18;
+  }
+
+  forward(speed, tilt);
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(irLedPin, OUTPUT);
+  pinMode(irLedPinLEFT, OUTPUT);
+  pinMode(irLedPinRIGHT, OUTPUT);
+
+  pinMode(irReceiver, INPUT);
+  pinMode(irReceiverLEFT, INPUT);
+  pinMode(irReceiverRIGHT, INPUT);
+
+  pinMode(LedPin, OUTPUT);
+  pinMode(LedPinLEFT, OUTPUT);
+  pinMode(LedPinRIGHT, OUTPUT);
+
+  leftWheel.attach(13);
+  rightWheel.attach(12);
+
+  forward(VELOCITY, 0);
+
+  Serial.println(F("PART 2 SEARCH"));
+
+  if (TWO_WALL_MS == 0) {
+    Serial.println(
+      F("SET TWO_WALL_MS AFTER CALIBRATION")
+    );
+  }
+}
+
+void loop() {
+  if (finished) {
+    stopWheels();
+    delay(100);
+    return;
+  }
+
+  if (turnPending && !recoverTurn()) {
+    return;
+  }
+
+  readSensors();
+  accountMotion();
+
+  if (frontReading <= FRONT_STOP) {
+    handleFeature(true);
+    return;
+  }
+
+  updateOpenings();
+
+  if (leftOpenCount >= 2 || rightOpenCount >= 2) {
+    handleFeature(false);
+    return;
+  }
+
+  followCorridor();
+}
