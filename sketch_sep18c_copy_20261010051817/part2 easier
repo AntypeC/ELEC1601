@@ -1,0 +1,1415 @@
+#include <Servo.h>
+
+const int frontIrLedPin = 6;
+const int leftIrLedPin = 10;
+const int rightIrLedPin = 2;
+
+const int frontReceiverPin = 7;
+const int leftReceiverPin = 11;
+const int rightReceiverPin = 3;
+
+const int frontLedPin = A1;
+const int leftLedPin = A2;
+const int rightLedPin = A0;
+
+const int leftServoPin = 13;
+const int rightServoPin = 12;
+
+const int normalSpeed = 35;
+const int slowSpeed = 30;
+const int turnPower = 120;
+
+const int frontStopValue = 5;
+const int frontSlowValue = 6;
+
+const int sideOpenValue = 7;
+const int sideWallValue = 5;
+const int sideTargetValue = 4;
+
+const unsigned long leftTurnTime = 300;
+const unsigned long rightTurnTime = 300;
+const unsigned long turnAroundTime = 600;
+
+const unsigned long junctionCenterTime = 150;
+const unsigned long sensorConfirmTime = 500;
+const unsigned long maximumTurnRecoveryTime = 300;
+
+const unsigned long twoWallTravelTime = 0;
+const unsigned int lengthErrorPercent = 15;
+
+const int maximumRouteNodes = 64;
+
+Servo leftWheel;
+Servo rightWheel;
+
+int routeEntry[maximumRouteNodes];
+int routeExit[maximumRouteNodes];
+bool routeRemaining[maximumRouteNodes][4];
+
+int routeDepth = 0;
+int heading = 0;
+
+bool returningFromDeadEnd = false;
+bool firstDeadEndVisited = false;
+bool mazeFinished = false;
+
+int leftReading = 0;
+int frontReading = 0;
+int rightReading = 0;
+
+bool leftOpeningReady = true;
+bool rightOpeningReady = true;
+
+int leftOpenCount = 0;
+int rightOpenCount = 0;
+int leftWallCount = 0;
+int rightWallCount = 0;
+
+bool robotMoving = false;
+bool robotRotating = false;
+bool segmentLengthKnown = false;
+
+unsigned long movementStartTime = 0;
+unsigned long currentSegmentTime = 0;
+
+bool turnNeedsRecovery = false;
+bool lastTurnWasLeft = true;
+bool recoveryInProgress = false;
+
+unsigned long recoveryStartTime = 0;
+
+int directionLeftOf(int direction)
+{
+  return (direction + 3) % 4;
+}
+
+int directionRightOf(int direction)
+{
+  return (direction + 1) % 4;
+}
+
+int directionBehind(int direction)
+{
+  return (direction + 2) % 4;
+}
+
+void recordMovementTime()
+{
+  if (robotMoving)
+  {
+    unsigned long now = millis();
+
+    unsigned long elapsed =
+      now - movementStartTime;
+
+    currentSegmentTime =
+      currentSegmentTime + elapsed;
+
+    movementStartTime = now;
+  }
+}
+
+void stopWheels()
+{
+  recordMovementTime();
+
+  robotMoving = false;
+  robotRotating = false;
+
+  leftWheel.writeMicroseconds(1495);
+  rightWheel.writeMicroseconds(1498);
+}
+
+void driveForward(
+  int speedValue,
+  int steeringValue
+)
+{
+  robotRotating = false;
+
+  leftWheel.writeMicroseconds(
+    1500 + speedValue
+  );
+
+  rightWheel.writeMicroseconds(
+    1500 -
+    (speedValue + 15) +
+    steeringValue
+  );
+
+  if (!robotMoving)
+  {
+    movementStartTime = millis();
+    robotMoving = true;
+  }
+}
+
+void rotateRobot(
+  bool turnLeft
+)
+{
+  recordMovementTime();
+
+  robotMoving = false;
+  robotRotating = true;
+
+  int servoPulse;
+
+  if (turnLeft)
+  {
+    servoPulse =
+      1500 - turnPower;
+  }
+  else
+  {
+    servoPulse =
+      1500 + turnPower;
+  }
+
+  leftWheel.writeMicroseconds(
+    servoPulse
+  );
+
+  rightWheel.writeMicroseconds(
+    servoPulse
+  );
+}
+
+void performTimedTurn(
+  bool turnLeft,
+  unsigned long turnTime
+)
+{
+  stopWheels();
+
+  rotateRobot(turnLeft);
+
+  delay(turnTime);
+
+  stopWheels();
+
+  lastTurnWasLeft = turnLeft;
+
+  turnNeedsRecovery = true;
+
+  recoveryInProgress = false;
+}
+
+int measureIrDistance(
+  int emitterPin,
+  int receiverPin,
+  int ledPin
+)
+{
+  int result = 0;
+
+  for (
+    long frequency = 38000;
+    frequency <= 45000;
+    frequency = frequency + 1000
+  )
+  {
+    tone(
+      emitterPin,
+      frequency
+    );
+
+    delay(5);
+
+    result =
+      result +
+      digitalRead(receiverPin);
+
+    noTone(emitterPin);
+  }
+
+  if (result != 8)
+  {
+    digitalWrite(
+      ledPin,
+      HIGH
+    );
+  }
+  else
+  {
+    digitalWrite(
+      ledPin,
+      LOW
+    );
+  }
+
+  return result;
+}
+
+int readFrontSensor()
+{
+  int value =
+    measureIrDistance(
+      frontIrLedPin,
+      frontReceiverPin,
+      frontLedPin
+    );
+
+  if (
+    value <= frontStopValue &&
+    !robotRotating
+  )
+  {
+    stopWheels();
+  }
+
+  return value;
+}
+
+void readAllSensors()
+{
+  frontReading =
+    readFrontSensor();
+
+  leftReading =
+    measureIrDistance(
+      leftIrLedPin,
+      leftReceiverPin,
+      leftLedPin
+    );
+
+  int secondFrontReading =
+    readFrontSensor();
+
+  if (
+    secondFrontReading <
+    frontReading
+  )
+  {
+    frontReading =
+      secondFrontReading;
+  }
+
+  rightReading =
+    measureIrDistance(
+      rightIrLedPin,
+      rightReceiverPin,
+      rightLedPin
+    );
+
+  int thirdFrontReading =
+    readFrontSensor();
+
+  if (
+    thirdFrontReading <
+    frontReading
+  )
+  {
+    frontReading =
+      thirdFrontReading;
+  }
+}
+
+void confirmSensorReadings()
+{
+  stopWheels();
+
+  unsigned long confirmStart =
+    millis();
+
+  readAllSensors();
+
+  int firstLeftReading =
+    leftReading;
+
+  int firstFrontReading =
+    frontReading;
+
+  int firstRightReading =
+    rightReading;
+
+  readAllSensors();
+
+  if (
+    firstLeftReading <
+    leftReading
+  )
+  {
+    leftReading =
+      firstLeftReading;
+  }
+
+  if (
+    firstFrontReading <
+    frontReading
+  )
+  {
+    frontReading =
+      firstFrontReading;
+  }
+
+  if (
+    firstRightReading <
+    rightReading
+  )
+  {
+    rightReading =
+      firstRightReading;
+  }
+
+  unsigned long elapsed =
+    millis() - confirmStart;
+
+  if (
+    elapsed <
+    sensorConfirmTime
+  )
+  {
+    delay(
+      sensorConfirmTime -
+      elapsed
+    );
+  }
+}
+
+void printSensorReadings()
+{
+  Serial.print(
+    F("L=")
+  );
+
+  Serial.print(
+    leftReading
+  );
+
+  Serial.print(
+    F(" F=")
+  );
+
+  Serial.print(
+    frontReading
+  );
+
+  Serial.print(
+    F(" R=")
+  );
+
+  Serial.println(
+    rightReading
+  );
+}
+
+void clearStoredRoute()
+{
+  routeDepth = 0;
+
+  returningFromDeadEnd = false;
+
+  firstDeadEndVisited = false;
+}
+
+bool continueTurnRecovery()
+{
+  int currentFrontValue =
+    readFrontSensor();
+
+  if (
+    currentFrontValue >
+    frontStopValue
+  )
+  {
+    stopWheels();
+
+    turnNeedsRecovery = false;
+
+    recoveryInProgress = false;
+
+    driveForward(
+      slowSpeed,
+      0
+    );
+
+    return true;
+  }
+
+  if (!recoveryInProgress)
+  {
+    recoveryStartTime =
+      millis();
+
+    recoveryInProgress = true;
+
+    rotateRobot(
+      lastTurnWasLeft
+    );
+
+    return false;
+  }
+
+  if (
+    millis() -
+    recoveryStartTime >=
+    maximumTurnRecoveryTime
+  )
+  {
+    stopWheels();
+
+    turnNeedsRecovery = false;
+
+    recoveryInProgress = false;
+
+    clearStoredRoute();
+
+    heading = 0;
+
+    segmentLengthKnown = false;
+
+    currentSegmentTime = 0;
+
+    leftOpeningReady = true;
+
+    rightOpeningReady = true;
+
+    leftOpenCount = 0;
+
+    rightOpenCount = 0;
+
+    leftWallCount = 0;
+
+    rightWallCount = 0;
+
+    Serial.println(
+      F("RECHECK EXITS")
+    );
+
+    return true;
+  }
+
+  return false;
+}
+
+void findAvailableDirections(
+  bool available[4]
+)
+{
+  for (
+    int direction = 0;
+    direction < 4;
+    direction++
+  )
+  {
+    available[direction] = false;
+  }
+
+  int backDirection =
+    directionBehind(heading);
+
+  available[backDirection] = true;
+
+  if (
+    leftReading >=
+    sideOpenValue
+  )
+  {
+    int leftDirection =
+      directionLeftOf(heading);
+
+    available[leftDirection] = true;
+  }
+
+  if (
+    frontReading >
+    frontStopValue
+  )
+  {
+    available[heading] = true;
+  }
+
+  if (
+    rightReading >=
+    sideOpenValue
+  )
+  {
+    int rightDirection =
+      directionRightOf(heading);
+
+    available[rightDirection] = true;
+  }
+}
+
+int chooseDirection(
+  bool choices[4]
+)
+{
+  int leftDirection =
+    directionLeftOf(heading);
+
+  int frontDirection =
+    heading;
+
+  int rightDirection =
+    directionRightOf(heading);
+
+  int backDirection =
+    directionBehind(heading);
+
+  if (
+    choices[leftDirection]
+  )
+  {
+    return leftDirection;
+  }
+
+  if (
+    choices[frontDirection]
+  )
+  {
+    return frontDirection;
+  }
+
+  if (
+    choices[rightDirection]
+  )
+  {
+    return rightDirection;
+  }
+
+  if (
+    choices[backDirection]
+  )
+  {
+    return backDirection;
+  }
+
+  return -1;
+}
+
+int planDirectionAtJunction(
+  bool available[4]
+)
+{
+  if (
+    returningFromDeadEnd &&
+    routeDepth > 0
+  )
+  {
+    int nodeIndex =
+      routeDepth - 1;
+
+    int expectedHeading =
+      directionBehind(
+        routeExit[nodeIndex]
+      );
+
+    if (
+      heading !=
+      expectedHeading
+    )
+    {
+      return -2;
+    }
+
+    bool possibleRemaining[4];
+
+    bool hasRemainingDirection =
+      false;
+
+    for (
+      int direction = 0;
+      direction < 4;
+      direction++
+    )
+    {
+      possibleRemaining[direction] =
+        routeRemaining[nodeIndex][direction] &&
+        available[direction];
+
+      if (
+        routeRemaining[nodeIndex][direction]
+      )
+      {
+        hasRemainingDirection = true;
+      }
+    }
+
+    if (hasRemainingDirection)
+    {
+      int chosenDirection =
+        chooseDirection(
+          possibleRemaining
+        );
+
+      if (
+        chosenDirection < 0
+      )
+      {
+        return -2;
+      }
+
+      routeRemaining
+        [nodeIndex]
+        [chosenDirection] =
+        false;
+
+      routeExit[nodeIndex] =
+        chosenDirection;
+
+      returningFromDeadEnd =
+        false;
+
+      return chosenDirection;
+    }
+
+    int backDirection =
+      directionBehind(
+        routeEntry[nodeIndex]
+      );
+
+    if (
+      !available[backDirection]
+    )
+    {
+      return -2;
+    }
+
+    routeDepth =
+      routeDepth - 1;
+
+    return backDirection;
+  }
+
+  returningFromDeadEnd = false;
+
+  bool forwardChoices[4];
+
+  int backDirection =
+    directionBehind(heading);
+
+  for (
+    int direction = 0;
+    direction < 4;
+    direction++
+  )
+  {
+    forwardChoices[direction] =
+      available[direction];
+  }
+
+  forwardChoices[backDirection] =
+    false;
+
+  int chosenDirection =
+    chooseDirection(
+      forwardChoices
+    );
+
+  if (
+    chosenDirection < 0 ||
+    routeDepth >=
+      maximumRouteNodes
+  )
+  {
+    return -2;
+  }
+
+  routeEntry[routeDepth] =
+    heading;
+
+  routeExit[routeDepth] =
+    chosenDirection;
+
+  for (
+    int direction = 0;
+    direction < 4;
+    direction++
+  )
+  {
+    routeRemaining
+      [routeDepth]
+      [direction] =
+      forwardChoices[direction];
+  }
+
+  routeRemaining
+    [routeDepth]
+    [chosenDirection] =
+    false;
+
+  routeDepth =
+    routeDepth + 1;
+
+  return chosenDirection;
+}
+
+void resetSegmentMeasurement()
+{
+  stopWheels();
+
+  currentSegmentTime = 0;
+
+  segmentLengthKnown = true;
+
+  leftOpeningReady = false;
+
+  rightOpeningReady = false;
+
+  leftOpenCount = 0;
+
+  rightOpenCount = 0;
+
+  leftWallCount = 0;
+
+  rightWallCount = 0;
+}
+
+void moveInDirection(
+  int chosenDirection
+)
+{
+  int turnDifference =
+    (
+      chosenDirection +
+      4 -
+      heading
+    ) %
+    4;
+
+  resetSegmentMeasurement();
+
+  if (
+    turnDifference == 3
+  )
+  {
+    Serial.println(
+      F("LEFT")
+    );
+
+    performTimedTurn(
+      true,
+      leftTurnTime
+    );
+  }
+  else if (
+    turnDifference == 1
+  )
+  {
+    Serial.println(
+      F("RIGHT")
+    );
+
+    performTimedTurn(
+      false,
+      rightTurnTime
+    );
+  }
+  else if (
+    turnDifference == 2
+  )
+  {
+    Serial.println(
+      F("U-TURN")
+    );
+
+    performTimedTurn(
+      true,
+      turnAroundTime
+    );
+  }
+  else
+  {
+    Serial.println(
+      F("STRAIGHT")
+    );
+
+    driveForward(
+      normalSpeed,
+      0
+    );
+  }
+
+  heading =
+    chosenDirection;
+}
+
+void updateOpeningDetection()
+{
+  if (!leftOpeningReady)
+  {
+    if (
+      leftReading <=
+      sideWallValue
+    )
+    {
+      leftWallCount =
+        leftWallCount + 1;
+    }
+    else
+    {
+      leftWallCount = 0;
+    }
+
+    if (
+      leftWallCount >= 2
+    )
+    {
+      leftOpeningReady = true;
+    }
+  }
+
+  if (!rightOpeningReady)
+  {
+    if (
+      rightReading <=
+      sideWallValue
+    )
+    {
+      rightWallCount =
+        rightWallCount + 1;
+    }
+    else
+    {
+      rightWallCount = 0;
+    }
+
+    if (
+      rightWallCount >= 2
+    )
+    {
+      rightOpeningReady = true;
+    }
+  }
+
+  if (
+    leftOpeningReady &&
+    leftReading >=
+      sideOpenValue
+  )
+  {
+    if (
+      leftOpenCount < 2
+    )
+    {
+      leftOpenCount =
+        leftOpenCount + 1;
+    }
+  }
+  else
+  {
+    leftOpenCount = 0;
+  }
+
+  if (
+    rightOpeningReady &&
+    rightReading >=
+      sideOpenValue
+  )
+  {
+    if (
+      rightOpenCount < 2
+    )
+    {
+      rightOpenCount =
+        rightOpenCount + 1;
+    }
+  }
+  else
+  {
+    rightOpenCount = 0;
+  }
+}
+
+void moveToCenterOfJunction()
+{
+  driveForward(
+    slowSpeed,
+    0
+  );
+
+  unsigned long centerStart =
+    millis();
+
+  while (
+    millis() -
+    centerStart <
+    junctionCenterTime
+  )
+  {
+    frontReading =
+      readFrontSensor();
+
+    if (
+      frontReading <=
+      frontStopValue
+    )
+    {
+      break;
+    }
+  }
+}
+
+bool isTargetLength()
+{
+  if (
+    !segmentLengthKnown ||
+    twoWallTravelTime == 0
+  )
+  {
+    return false;
+  }
+
+  unsigned long allowedError =
+    twoWallTravelTime *
+    lengthErrorPercent /
+    100;
+
+  bool longEnough =
+    currentSegmentTime >=
+    twoWallTravelTime -
+    allowedError;
+
+  bool shortEnough =
+    currentSegmentTime <=
+    twoWallTravelTime +
+    allowedError;
+
+  return
+    longEnough &&
+    shortEnough;
+}
+
+void handleDeadEnd()
+{
+  stopWheels();
+
+  Serial.print(
+    F("DEAD END segment_ms=")
+  );
+
+  Serial.print(
+    currentSegmentTime
+  );
+
+  Serial.print(
+    F(" known=")
+  );
+
+  if (segmentLengthKnown)
+  {
+    Serial.println(1);
+  }
+  else
+  {
+    Serial.println(0);
+  }
+
+  if (
+    isTargetLength()
+  )
+  {
+    Serial.println(
+      F("FINISH")
+    );
+
+    mazeFinished = true;
+
+    return;
+  }
+
+  if (
+    routeDepth == 0
+  )
+  {
+    if (
+      returningFromDeadEnd ||
+      firstDeadEndVisited
+    )
+    {
+      clearStoredRoute();
+
+      Serial.println(
+        F("RESTART SEARCH")
+      );
+    }
+
+    firstDeadEndVisited = true;
+  }
+  else
+  {
+    returningFromDeadEnd = true;
+  }
+
+  int oppositeDirection =
+    directionBehind(heading);
+
+  moveInDirection(
+    oppositeDirection
+  );
+
+  leftOpeningReady = true;
+
+  rightOpeningReady = true;
+}
+
+void handleJunctionOrWall(
+  bool frontWallEvent
+)
+{
+  if (frontWallEvent)
+  {
+    confirmSensorReadings();
+
+    if (
+      frontReading >
+      frontStopValue
+    )
+    {
+      driveForward(
+        slowSpeed,
+        0
+      );
+
+      return;
+    }
+  }
+  else
+  {
+    bool validLeftOpening =
+      leftOpeningReady &&
+      leftReading >=
+        sideOpenValue;
+
+    bool validRightOpening =
+      rightOpeningReady &&
+      rightReading >=
+        sideOpenValue;
+
+    if (
+      !validLeftOpening &&
+      !validRightOpening
+    )
+    {
+      leftOpenCount = 0;
+
+      rightOpenCount = 0;
+
+      return;
+    }
+
+    moveToCenterOfJunction();
+
+    if (
+      frontReading <=
+      frontStopValue
+    )
+    {
+      confirmSensorReadings();
+    }
+  }
+
+  printSensorReadings();
+
+  bool available[4];
+
+  findAvailableDirections(
+    available
+  );
+
+  int backDirection =
+    directionBehind(heading);
+
+  bool hasForwardOption =
+    false;
+
+  for (
+    int direction = 0;
+    direction < 4;
+    direction++
+  )
+  {
+    if (
+      direction !=
+        backDirection &&
+      available[direction]
+    )
+    {
+      hasForwardOption = true;
+    }
+  }
+
+  if (!hasForwardOption)
+  {
+    handleDeadEnd();
+
+    return;
+  }
+
+  int chosenDirection =
+    planDirectionAtJunction(
+      available
+    );
+
+  if (
+    chosenDirection < 0
+  )
+  {
+    Serial.println(
+      F("REBUILD ROUTE")
+    );
+
+    clearStoredRoute();
+
+    chosenDirection =
+      planDirectionAtJunction(
+        available
+      );
+  }
+
+  if (
+    chosenDirection >= 0
+  )
+  {
+    moveInDirection(
+      chosenDirection
+    );
+  }
+}
+
+void followCorridor()
+{
+  int speedValue;
+
+  if (
+    frontReading <=
+    frontSlowValue
+  )
+  {
+    speedValue =
+      slowSpeed;
+  }
+  else
+  {
+    speedValue =
+      normalSpeed;
+  }
+
+  int steeringValue = 0;
+
+  bool leftWallDetected =
+    leftReading <
+    sideOpenValue;
+
+  bool rightWallDetected =
+    rightReading <
+    sideOpenValue;
+
+  if (
+    leftWallDetected &&
+    rightWallDetected
+  )
+  {
+    if (
+      leftReading >
+      rightReading
+    )
+    {
+      steeringValue = -10;
+    }
+    else if (
+      rightReading >
+      leftReading
+    )
+    {
+      steeringValue = 10;
+    }
+  }
+  else if (
+    leftWallDetected
+  )
+  {
+    if (
+      leftReading <
+      sideTargetValue
+    )
+    {
+      steeringValue = 10;
+    }
+    else if (
+      leftReading >
+      sideTargetValue
+    )
+    {
+      steeringValue = -10;
+    }
+  }
+  else if (
+    rightWallDetected
+  )
+  {
+    if (
+      rightReading <
+      sideTargetValue
+    )
+    {
+      steeringValue = -10;
+    }
+    else if (
+      rightReading >
+      sideTargetValue
+    )
+    {
+      steeringValue = 10;
+    }
+  }
+
+  if (
+    leftReading <= 1 &&
+    rightReading > 1
+  )
+  {
+    speedValue =
+      slowSpeed;
+
+    steeringValue = 18;
+  }
+  else if (
+    rightReading <= 1 &&
+    leftReading > 1
+  )
+  {
+    speedValue =
+      slowSpeed;
+
+    steeringValue = -18;
+  }
+
+  driveForward(
+    speedValue,
+    steeringValue
+  );
+}
+
+void setup()
+{
+  Serial.begin(9600);
+
+  pinMode(
+    frontIrLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    leftIrLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    rightIrLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    frontReceiverPin,
+    INPUT
+  );
+
+  pinMode(
+    leftReceiverPin,
+    INPUT
+  );
+
+  pinMode(
+    rightReceiverPin,
+    INPUT
+  );
+
+  pinMode(
+    frontLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    leftLedPin,
+    OUTPUT
+  );
+
+  pinMode(
+    rightLedPin,
+    OUTPUT
+  );
+
+  leftWheel.attach(
+    leftServoPin
+  );
+
+  rightWheel.attach(
+    rightServoPin
+  );
+
+  driveForward(
+    normalSpeed,
+    0
+  );
+
+  Serial.println(
+    F("PART 2 SEARCH")
+  );
+
+  if (
+    twoWallTravelTime == 0
+  )
+  {
+    Serial.println(
+      F("SET TWO_WALL_MS AFTER CALIBRATION")
+    );
+  }
+}
+
+void loop()
+{
+  if (mazeFinished)
+  {
+    stopWheels();
+
+    delay(100);
+
+    return;
+  }
+
+  if (turnNeedsRecovery)
+  {
+    bool recoveryFinished =
+      continueTurnRecovery();
+
+    if (!recoveryFinished)
+    {
+      return;
+    }
+  }
+
+  readAllSensors();
+
+  recordMovementTime();
+
+  if (
+    frontReading <=
+    frontStopValue
+  )
+  {
+    handleJunctionOrWall(
+      true
+    );
+
+    return;
+  }
+
+  updateOpeningDetection();
+
+  if (
+    leftOpenCount >= 2 ||
+    rightOpenCount >= 2
+  )
+  {
+    handleJunctionOrWall(
+      false
+    );
+
+    return;
+  }
+
+  followCorridor();
+}
