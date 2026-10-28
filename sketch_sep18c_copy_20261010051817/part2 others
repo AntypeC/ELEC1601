@@ -1,0 +1,287 @@
+//#define TAKE_HOME_BOARD   // comment out for the lab robot
+
+#ifdef TAKE_HOME_BOARD
+  #include "ELEC1601_TakeHomeBoard.h"
+#else
+  #include <Servo.h>
+#endif
+
+const int irLedLeft     = 10;
+const int irSensorLeft  = 11;
+const int irLedFront    = 6;
+const int irSensorFront = 7;
+const int irLedRight    = 2;
+const int irSensorRight = 3;
+
+const int SERVO_L_PIN = 13;
+const int SERVO_R_PIN = 12;
+
+const int LED_R = A0;
+const int LED_M = A1;
+const int LED_L = A2;
+
+// Score = how many of the swept frequencies saw a reflection.
+// 0 = nothing there, higher = closer. Max is 17 with these sweep settings.
+const long SWEEP_START = 38000;  // Hz, receiver's peak sensitivity
+const long SWEEP_END   = 42000;
+const long SWEEP_STEP  = 250;
+
+const int SIDE_WALL   = 2;   // side score >= this : a wall is there (open side reads 0, weakest wall 4)
+const int FRONT_WALL  = 5;   // front score >= this : wall closer than 10 cm (10 cm reads 1, closest turn wall 9)
+const int SIDE_CLOSE  = 16;  // side score >= this : very close to a side wall (5-8). Must beat 15 (right wall in pos 3)
+const int CENTRE_TOL  = 12;  // |L - R| <= this : centred (centred reads 8 apart, off-centre 17)
+const int ANGLED_FRONT = 1;  // 7/8: front score >= this = angled towards the wall (5/6 read F = 0)
+
+// Speeds are microseconds away from the centre value. The take-home board caps at 100.
+const int CENTRE_L    = 1500; // value where the left wheel stands still
+const int CENTRE_R    = 1500; // value where the right wheel stands still
+const int SPEED_L     = 100;  // straight-line speed of each wheel. If the robot
+const int SPEED_R     = 100;  // curves, lower the speed of the wheel on the outside of the curve
+const int TURN_SPEED  = 50;   // slower turns are more repeatable
+const int MS_PER_CM   = 200;   // time to drive 1 cm at SPEED_L/SPEED_R
+const int MS_PER_DEG  = 8;   // time to turn 1 degree at TURN_SPEED
+const int PAUSE_MS    = 200;  // stop time between moves so the robot settles
+
+const int S1_FWD_CM       = 5;   // corridor: forward distance
+const int TURN_MAX_CM     = 30;  // 2/3: give up searching for the corridor after this
+const int TURN_EXTRA_CM   = 5;   // 2/3: keep going after both walls are seen
+const int S4_FWD_CM       = 6;   // dead end: forward after 180 (brief: >= 5)
+const int SHIFT_DEG       = 30;  // 5/6: angle to steer towards the centre
+const int SHIFT_FWD_CM    = 8;   // 5/6: forward while angled (8*sin30 = 4 cm sideways)
+const int SHIFT_BACK_CM   = 7;   // 5/6: reverse to be level with start (8*cos30)
+const int ANGLED_DEG      = 30;  // 7/8: rotation to become parallel
+const int CORNER_CLOSE    = 17;  // 9: left AND front score >= this : jammed in a top-left corner
+const int S9_BACK_CM      = 5;   // 9: reverse out of the corner
+const int S9_TURN_DEG     = 40;  // 9: then turn clockwise towards the centre
+
+const int SHOW_MS     = 5000; // code shown with robot stationary (brief: >= 5 s)
+const int FLASH_MS    = 1000; // on/off time for flashing codes
+
+int stopped = 0;           // 1 once a scenario has run
+int chains = 0;            // how many times 7/8 has handed over to 5/6
+bool wheelsOn = false;     // true while the servos are receiving a signal
+int distL, distF, distR;   // sensor scores
+Servo servoL, servoR;
+
+// Each wheel's speed from its centre value: positive = forward, negative = back.
+// The right servo is mounted mirrored, so its value is flipped here once.
+void wheels(int left, int right) {
+  if (!wheelsOn) {                   // reconnect the servo signal before moving
+    servoL.attach(SERVO_L_PIN);
+    servoR.attach(SERVO_R_PIN);
+    wheelsOn = true;
+  }
+  servoL.writeMicroseconds(CENTRE_L + left);
+  servoR.writeMicroseconds(CENTRE_R - right);
+}
+
+// Stop by cutting the servo signal. A servo with no signal stays still,
+// so it can't twitch while the sensors are being read or creep if it isn't centred.
+void halt() {
+  servoL.detach();
+  servoR.detach();
+  wheelsOn = false;
+}
+
+void stopWheels() {
+  halt();
+  delay(PAUSE_MS);
+}
+
+void forward(int cm) {
+  wheels(SPEED_L, SPEED_R);
+  delay((long)cm * MS_PER_CM);
+  stopWheels();
+}
+
+void backward(int cm) {
+  wheels(-SPEED_L, -SPEED_R);
+  delay((long)cm * MS_PER_CM);
+  stopWheels();
+}
+
+void turnClockwise(int deg) {        // pivot right on the spot
+  wheels(TURN_SPEED, -TURN_SPEED);
+  delay((long)deg * MS_PER_DEG);
+  stopWheels();
+}
+
+void turnAntiClockwise(int deg) {    // pivot left on the spot
+  wheels(-TURN_SPEED, TURN_SPEED);
+  delay((long)deg * MS_PER_DEG);
+  stopWheels();
+}
+
+// The receiver is tuned to 38 kHz. A close wall still reflects enough at
+// off-peak frequencies to be detected; a far one does not.
+int irScore(int irLed, int irSensor) {
+  int hits = 0;
+  for (long f = SWEEP_START; f <= SWEEP_END; f += SWEEP_STEP) {
+    tone(irLed, f, 8);
+    delay(1);
+    if (digitalRead(irSensor) == LOW) hits++;
+    noTone(irLed);
+    delay(1);
+  }
+  return hits;
+}
+
+void readSensors() {
+  distL = irScore(irLedLeft,  irSensorLeft);
+  distF = irScore(irLedFront, irSensorFront);
+  distR = irScore(irLedRight, irSensorRight);
+}
+
+void printSensors() {
+  Serial.print("L="); Serial.print(distL);
+  Serial.print("\tF="); Serial.print(distF);
+  Serial.print("\tR="); Serial.println(distR);
+}
+
+// Drive forward until both side sensors see a wall, then TURN_EXTRA_CM more.
+// Gives up after TURN_MAX_CM. Only the side sensors are read, to check more often.
+void forwardUntilCorridor() {
+  unsigned long limit = (unsigned long)TURN_MAX_CM * MS_PER_CM;
+  unsigned long start = millis();
+  wheels(SPEED_L, SPEED_R);
+  while (millis() - start < limit) {
+    if (irScore(irLedLeft,  irSensorLeft)  >= SIDE_WALL &&
+        irScore(irLedRight, irSensorRight) >= SIDE_WALL) break;
+  }
+  forward(TURN_EXTRA_CM);   // carries on without stopping in between
+}
+
+void setLeds(bool l, bool m, bool r) {
+  digitalWrite(LED_L, l);
+  digitalWrite(LED_M, m);
+  digitalWrite(LED_R, r);
+}
+
+// Show a code for SHOW_MS with the robot stopped. flashM / flashR make that LED blink.
+void showCode(bool l, bool m, bool r, bool flashM, bool flashR) {
+  halt();
+  for (unsigned long t = 0; t < (unsigned long)SHOW_MS; t += FLASH_MS) {
+    bool on = (t / FLASH_MS) % 2 == 0;
+    setLeds(l, m || (flashM && on), r || (flashR && on));
+    delay(FLASH_MS);
+  }
+}
+
+void setup() {
+  Serial.begin(9600);   // first, so the take-home self-test can print
+
+  pinMode(irSensorLeft,  INPUT);
+  pinMode(irSensorFront, INPUT);
+  pinMode(irSensorRight, INPUT);
+
+  pinMode(irLedLeft,  OUTPUT);
+  pinMode(irLedFront, OUTPUT);
+  pinMode(irLedRight, OUTPUT);
+  pinMode(LED_L, OUTPUT);
+  pinMode(LED_M, OUTPUT);
+  pinMode(LED_R, OUTPUT);
+
+#ifdef TAKE_HOME_BOARD
+  // servoL.attach(0);      // uncomment to run the board self-test (block each sensor)
+  servoL.setFlashRate();    // sets blink rate for both wheel LEDs (library needs this)
+#endif
+  halt();                   // servos only get a signal while moving (see wheels())
+
+  delay(500);   // let sensors settle
+}
+
+void loop() {
+  // checked from 9 down to 1, so the higher-numbered scenario wins if two match
+  readSensors();
+  printSensors();
+
+  if (stopped) {             // a scenario has already run: just keep printing sensors
+    delay(300);
+    return;
+  }
+
+  bool wallLeft  = distL >= SIDE_WALL;
+  bool wallRight = distR >= SIDE_WALL;
+  bool wallFront = distF >= FRONT_WALL;
+
+  bool corner     = distL >= CORNER_CLOSE && distF >= CORNER_CLOSE && !wallRight;
+  bool leftClose  = distL >= SIDE_CLOSE && distL - distR > CENTRE_TOL;   // 5 or 7
+  bool rightClose = distR >= SIDE_CLOSE && distR - distL > CENTRE_TOL;   // 6 or 8
+  bool angled     = distF >= ANGLED_FRONT;   // a weak front reflection: pointing at the side wall (7/8)
+
+  if (corner) {
+    // 9: jammed in a top-left corner  (L off, M flash, R off)
+    Serial.println("Scenario 9");
+    showCode(0, 0, 0, 1, 0);
+    backward(S9_BACK_CM);
+    turnClockwise(S9_TURN_DEG);
+    forward(4);
+  }
+  else if (rightClose && angled) {
+    // 8: close to right wall, angled towards it  (L off, M off, R flash)
+    Serial.println("Scenario 8");
+    showCode(0, 0, 0, 0, 1);
+    turnAntiClockwise(40);
+    if (chains++ < 1) return;   // now parallel: check again, which should find scenario 6
+  }
+  else if (leftClose && angled) {
+    // 7: close to left wall, angled towards it  (L on, M on, R on)
+    Serial.println("Scenario 7");
+    showCode(1, 1, 1, 0, 0);
+    turnClockwise(ANGLED_DEG);
+    if (chains++ < 1) return;   // now parallel: check again, which should find scenario 5
+  }
+  else if (!wallFront && wallRight && distR - distL > CENTRE_TOL) {
+    // 6: close to right wall, parallel  (L on, M on, R off)
+    Serial.println("Scenario 6");
+    showCode(1, 1, 0, 0, 0);
+    turnAntiClockwise(SHIFT_DEG);
+    forward(5);
+    turnClockwise(15);
+    backward(SHIFT_BACK_CM);
+  }
+  else if (!wallFront && wallLeft && distL - distR > CENTRE_TOL) {
+    // 5: close to left wall, parallel  (L on, M off, R on)
+    Serial.println("Scenario 5");
+    showCode(1, 0, 1, 0, 0);
+    turnClockwise(SHIFT_DEG);
+    forward(5);
+    turnAntiClockwise(25);
+    backward(SHIFT_BACK_CM);
+  }
+  else if (wallFront && wallLeft && wallRight) {
+    // 4: dead end  (L on, M off, R off)
+    Serial.println("Scenario 4");
+    showCode(1, 0, 0, 0, 0);
+    turnClockwise(190);
+    forward(S4_FWD_CM);
+  }
+  else if (wallFront && wallRight && !wallLeft) {
+    // 3: ideal position for left turn  (L off, M on, R on)
+    Serial.println("Scenario 3");
+    showCode(0, 1, 1, 0, 0);
+    turnAntiClockwise(105);
+    forwardUntilCorridor();
+  }
+  else if (wallFront && wallLeft && !wallRight) {
+    // 2: ideal position for right turn  (L off, M on, R off)
+    Serial.println("Scenario 2");
+    showCode(0, 1, 0, 0, 0);
+    turnClockwise(90);
+    forwardUntilCorridor();
+  }
+  else if (!wallFront && wallLeft && wallRight && abs(distL - distR) <= CENTRE_TOL) {
+    // 1: middle of corridor  (L off, M off, R on)
+    Serial.println("Scenario 1");
+    showCode(0, 0, 1, 0, 0);
+    forward(S1_FWD_CM);
+  }
+  else {
+    // 0: unknown - do not move  (all LEDs off)
+    Serial.println("Scenario 0");
+    setLeds(0, 0, 0);
+    halt();
+  }
+
+  stopped = 1;   // only run one scenario per reset
+}
